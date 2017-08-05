@@ -1,0 +1,271 @@
+#!/usr/bin/env python
+
+#########################################################################
+# File Name: annotation_pipeline.py
+# Author: Tang Hao
+# mail: tanghao@genebang.com
+# Created Time: Tue 04 Jul 2017 11:49:33 AM CST
+#########################################################################
+
+import argparse, os
+
+def build_hisatdb(genome):
+	script = '''
+job_begin
+	name build_hisatdb
+	sched_options -V -cwd -l vf=20G,p=8
+	cmd_begin
+		mkdir -p {path}/01.illumina_RNAseq/00.build_db;
+		cd {path}/01.illumina_RNAseq/00.build_db &&
+		/opt/bio/hisat2-2.0.4/hisat2-build {G} {path}/01.illumina_RNAseq/00.build_db/genome -p 5
+	cmd_end
+job_end
+'''.format(G = genome, path = os.getcwd())
+	return script
+
+def build_formatdb(genome):
+	script = '''
+job_begin
+	name build_formatdb
+	sched_options -V -cwd -l vf=2G,p=1
+	cmd_begin
+		mkdir -p {path}/02.homolog/00.formatdb;
+		cd {path}/02.homolog/00.formatdb &&
+		ln -s {G} &&
+		/opt/bio/blast-2.2.26/bin/formatdb -i {path}/02.homolog/00.formatdb/{g} -p F -o T
+	cmd_end
+job_end
+'''.format(G = genome, path = os.getcwd(), g = os.path.basename(genome))
+	return script
+
+def homolog(genome, pep, n, species):
+	script = '''
+job_begin
+	name homolog_{species}
+	host localhost
+	cmd_begin
+		mkdir {path}/02.homolog/0{n}.{species}
+		cd {path}/02.homolog/0{n}.{species} &&
+		perl /its1/GB_BT2/tanghao/Project/annotation_pipeline_V2/homolog/protein_map_genome.pl --step 1234 --cpu 40 --align_rate 0.01 --extend_len 500 --tophit 3 --blast_eval 1e-5 --line 1000 {pep} {path}/02.homolog/00.formatdb/{g}
+	cmd_end
+job_end
+
+order homolog_{species} after build_formatdb
+'''.format(g = os.path.basename(genome), path = os.getcwd(), pep = pep, n = str(n), species = species)
+	return script
+
+def eachomolog(genome, out, list):
+	with open(list) as list:
+		n = 1
+		for line in list:
+			pep = line.strip().split()[1]
+			species = line.strip().split()[0]
+			out.write(homolog(genome, pep, n, species))
+			n += 1
+
+def hisat_stringtie(list):
+	script = '''
+job_begin
+	name hisat_stringtie
+	host localhost
+	cmd_begin
+		cd {path}/01.illumina_RNAseq &&
+		python /its1/GB_BT2/tanghao/Project/annotation_pipeline_V2/hisat_stringtie.py {l} &&
+		perl /its1/GB_BT2/tanghao/ownscript/qsub-sge_mod.pl --resource vf=20G,p=8 -convert no --maxjob 1 --lines 1 {path}/01.illumina_RNAseq/shell/all_shellscript.sh
+	cmd_end
+job_end 
+
+order hisat_stringtie after build_hisatdb
+'''.format(l = list, path = os.getcwd())
+	return script
+
+def stringtie_merge(list):
+	script = '''
+job_begin
+	name stringtie_merge
+	sched_options -V -cwd -l vf=2G,p=1
+	cmd_begin
+		cd {path}/01.illumina_RNAseq &&
+		python /its1/GB_BT2/tanghao/Project/annotation_pipeline_V2/stringtie_list.py {l} &&
+		/opt/bio/stringtie-1.2.4.Linux_x86_64/stringtie --merge  -o {path}/01.illumina_RNAseq/03.stringtie/stringtie_merged.gtf {path}/01.illumina_RNAseq/03.stringtie/stringtie.lst
+	cmd_end
+job_end
+
+order stringtie_merge after hisat_stringtie
+'''.format(l = list, path = os.getcwd())
+	return script
+
+def convertbam_ccs(fofn):
+	script = '''
+job_begin
+	name convert_css
+	host localhost
+	cmd_begin
+		mkdir -p {path}/03.Isoseq/00.shell {path}/03.Isoseq/01.bax2bam {path}/03.Isoseq/02.CCS;
+		cd {path}/03.Isoseq/00.shell &&
+		ln -s {absfofn} &&
+		python /its1/GB_BT2/tanghao/Project/annotation_pipeline_V2/convertbam_ccs.py {fofn} &&
+		perl /its1/GB_BT2/tanghao/ownscript/qsub-sge_mod.pl --resource vf=30G,p=1 -convert no --maxjob 100 --lines 1 {path}/03.Isoseq/00.shell/all.sh
+	cmd_end
+job_end
+'''.format(path = os.getcwd(), fofn = os.path.basename(fofn), absfofn = os.path.abspath(fofn))
+	return script
+
+def deal_fofn(fofn):
+	lst = []
+	with open(fofn, 'r') as lines:
+		for line in lines:
+			path = line.strip()
+			sample = '_'.join(os.path.basename(path).split('_')[:-1])
+			lst.append(sample)
+		sampleset = set(lst)
+	return sampleset
+
+def classify(sampleset):
+	script = '''
+job_begin
+	name classify
+	sched_options -V -cwd -l vf=50G,p=24
+	cmd_begin
+		mkdir -p {path}/03.Isoseq/03.classify;
+		cd {path}/03.Isoseq/03.classify &&
+		/its1/GB_BT1/lixiangfeng/software/smrtlink/smrtcmds/bin/dataset create --type ConsensusReadSet all.ccs.xml {all_ccs} &&
+		/its1/GB_BT1/lixiangfeng/software/smrtlink/smrtcmds/bin/dataset create --type SubreadSet all.subreads.xml {all_subreads} &&
+		/its1/GB_BT1/lixiangfeng/software/smrtlink/smrtcmds/bin/pbtranscript classify --flnc isoseq_flnc.fasta --nfl isoseq_nfl.fasta -d classify_out --cpus 24 --min_seq_len 200 all.ccs.xml isoseq_draft.fasta
+	cmd_end
+job_end
+
+order classify after convert_css
+'''.format(all_ccs = ' '.join(['{path}/03.Isoseq/02.CCS/'.format(path = os.getcwd()) + i + '.ccs.bam' for i in sampleset]), all_subreads = ' '.join(['{path}/03.Isoseq/01.bax2bam/'.format(path = os.getcwd()) + i + '.subreads.bam' for i in sampleset]), path = os.getcwd())
+	return script
+
+def cluster_polish():
+	script = '''
+job_begin
+	name cluster_polish
+	host localhost
+	cmd_begin
+		mkdir {path}/03.Isoseq/04.cluster_polish;
+		cd {path}/03.Isoseq/04.cluster_polish &&
+		/its1/GB_BT1/lixiangfeng/Iso-Seq-Denovo/software/smrtlink/new/bundles/smrttools/install/smrttools-fromsrc_4.0.0.190159/smrtcmds/bin/pbtranscript cluster --nfl_fa {path}/03.Isoseq/03.classify/isoseq_nfl.fasta --bas_fofn {path}/03.Isoseq/03.classify/all.subreads.xml --quiver --use_sge --blasr_nproc 4 --quiver_nproc 2 --gcon_nproc 2 --max_sge_jobs 200 {path}/03.Isoseq/03.classify/isoseq_flnc.fasta unpolish_Consensus.fasta &&
+	cmd_end
+job_end
+
+order cluster_polish after classify
+'''.format(path = os.getcwd())
+	return script
+
+def GMAP_build(genome):
+	script = '''
+job_begin
+	name gmap_build
+	sched_options -V -cwd -l vf=30G,p=1
+	cmd_begin
+		mkdir -p {path}/03.Isoseq/05.GMAP/00.build_gmapdb &&
+		cd {path}/03.Isoseq/05.GMAP/00.build_gmapdb;
+		/its1/GB_BT2/tanghao/software/gmap-2017-05-08/bin/gmap_build -d Genome {G} -D {path}/03.Isoseq/05.GMAP/00.build_gmapdb
+	cmd_end
+job_end
+'''.format(path = os.getcwd(), G = genome)
+	return script
+
+def GMAP():
+	script = '''
+job_begin
+	name gmap
+	sched_options -V -cwd -l vf=60G,p=4
+	cmd_begin
+		mkdir -p {path}/03.Isoseq/05.GMAP/01.gmap;
+		cd {path}/03.Isoseq/05.GMAP/01.gmap &&
+		/its1/GB_BT2/tanghao/software/gmap-2017-05-08/bin/gmap -D {path}/03.Isoseq/05.GMAP/00.build_gmapdb -d Genome -z sense_force -f samse -n 0 -t 4 {path}/03.Isoseq/04.cluster_polish/cluster_out/all_quivered_hq.100_30_0.99.fasta > hq_quivered.sam 2> hq_quivered.sam.log
+	cmd_end
+job_end
+
+order gmap ofter gmap_build
+'''.format(path = os.getcwd())
+	return script
+
+def collapse():
+	script = '''
+job_begin
+	name collapse_isoforms
+	sched_options -V -cwd -l vf=10G,p=1
+	cmd_begin
+		mkdir -p {path}/03.Isoseq/05.GMAP/02.collapse_isoforms;
+		cd {path}/03.Isoseq/05.GMAP/02.collapse_isoforms &&
+		sort -k 3,3 -k 4,4n {path}/03.Isoseq/05.GMAP/01.gmap/hq_quivered.sam | grep @ -v > hq_quivered.sort.sam &&
+		/opt/bio/cDNA_Cupcake/build/scripts-2.7/collapse_isoforms_by_sam.py --input {path}/03.Isoseq/04.cluster_polish/cluster_out/all_quivered_hq.100_30_0.99.fasta -s hq_quivered.sort.sam -o hq_quivered
+	cmd_end
+job_end
+
+order collapse_isoforms after gmap
+'''.format(path = os.getcwd())
+	return script
+
+def transdecoder(genome):
+	script = '''
+job_begin
+	name transdecoder
+	sched_options -V -cwd -l vf=10G,p=1
+	cmd_begin
+		mkdir -p {path}/03.Isoseq/06.Transdecoder;
+		cd {path}/03.Isoseq/06.Transdecoder &&
+		/opt/bio/TransDecoder/util/cufflinks_gtf_to_alignment_gff3.pl {path}/03.Isoseq/05.GMAP/02.collapse_isoforms/hq_quivered.collapsed.gff > transcripts.gff3 &&
+		/opt/bio/TransDecoder/util/cufflinks_gtf_genome_to_cdna_fasta.pl {path}/03.Isoseq/05.GMAP/02.collapse_isoforms/hq_quivered.collapsed.gff {G} > transcripts.fasta &&
+		/opt/bio/TransDecoder/TransDecoder.LongOrfs -t transcripts.fasta &&
+		/opt/bio/TransDecoder/TransDecoder.Predict -t transcripts.fasta &&
+		/opt/bio/TransDecoder/util/cdna_alignment_orf_to_genome_orf.pl transcripts.fasta.transdecoder.gff3 transcripts.gff3 transcripts.fasta 2> transcripts.fasta.transdecoder.genome.gff3.log > transcripts.fasta.transdecoder.genome.gff3
+	cmd_end
+job_end
+
+order transdecoder after collapse_isoforms
+'''.format(G = genome, path = os.getcwd())
+	return script
+
+def Parser_args():
+	description = '''
+		This is a pipeline of genome annotation with Isoseq data~!
+'''
+	epilog = '''
+	After you execute this program, you will obtain a "annotation.job" file, run it as:
+		'/opt/bio/SJM-master/src/sjm annotation.job'
+ _____________________________________________________________
+< The author is tanghao, and his mail is tanghao@genebang.com >
+ -------------------------------------------------------------
+		                \   ^__^
+        		         \  (oo)\_______
+                		    (__)\       )\/\\
+                        		||----w |
+		WWWW   WwWw     WwW     ||     ||  WwWW
+'''
+	parser = argparse.ArgumentParser(formatter_class = argparse.RawDescriptionHelpFormatter, description = description, epilog = epilog)
+	pginput = parser.add_argument_group('required arguments')
+	pginput.add_argument('--genome', metavar = '', required = True, help = 'genome sequence; fasta format')
+	pginput.add_argument('--RNAseqlist', metavar = '', required = True, help = 'fastq file list for RNAseq, the read1 and read2 are separated by commas without spaces and in the same line')
+	pginput.add_argument('--peplist', metavar = '', required = True, help = 'the protein file list of homolog, the name of species and the absolute path are separated by space in the same line')
+#	pginput.add_argument('--fofn', metavar = '', required = True, help = 'the absolute path of bax file of Isoseq')
+
+	args = parser.parse_args()
+	return args
+
+def main():
+	args = Parser_args()
+	#os.system('mkdir log')
+	with open('annotation.job', 'w') as out:
+		#out.write(build_hisatdb(args.genome))
+		#out.write(hisat_stringtie(args.RNAseqlist))
+		#out.write(stringtie_merge(args.RNAseqlist))
+		out.write(build_formatdb(args.genome))
+		eachomolog(args.genome, out, args.peplist)
+		#out.write(GMAP_build(args.genome))
+		#sample = deal_fofn(args.fofn)
+		#out.write(classify(sample))
+		#out.write(cluster_polish())
+		#out.write(GMAP())
+		#out.write(collapse())
+		#out.write(transdecoder(args.genome))
+
+		out.write('\n'+'log_dir {path}/log'.format(path = os.getcwd()))
+
+if __name__ == '__main__':
+    main()
